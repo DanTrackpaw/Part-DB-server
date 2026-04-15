@@ -62,3 +62,5 @@ docker-data/
 scripts/
 db/
 docker-compose.yaml
+AGENT.md
+AGENT_NOTES.md
