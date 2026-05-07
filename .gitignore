@@ -64,4 +64,4 @@ db/
 docker-compose.yaml
 AGENT.md
 AGENT_NOTES.md
-/.context/
+context/
