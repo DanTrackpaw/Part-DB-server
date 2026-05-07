@@ -1,0 +1,327 @@
+Part-DB SQLite Category Export - Modular
+Architecture
+Overview
+A completely isolated, self-contained module for exporting Part-DB inventory as a flat
+SQLite database with per-category tables. Minimal mainline impact — can be added
+without modifying core Part-DB code.
+Modularity Strategy
+A. Completely Self-Contained
+The entire feature lives in one new directory:
+src/Services/ImportExportSystem/SQLiteCategoryExporter/
+├── SQLiteCategoryExporter.php# Main orchestrator (Symfony service)
+├── CategoryTableBuilder.php# Creates & populates tables
+├── PartFieldMapper.php# Maps Part entities → table columns
+├── SQLiteConnectionFactory.php# Creates temp SQLite connections
+└── Resources/
+└── schema_template.sql
+B. Zero Mainline Changes Needed
+This feature requires NO modifications to:
+Controllers
+Routes
+Entities
+Database schema
+Doctrine configuration
+Services configuration
+# Optional: base schema DDLOptional single-point integration (1 tiny touch):
+Add one export button to Tools UI (or make it a CLI command only)
+Implementation Approach
+1. Core Service (Isolated, Testable)
+// src/Services/ImportExportSystem/SQLiteCategoryExporter/SQLiteCategoryExporter.php
+namespace App\Services\ImportExportSystem\SQLiteCategoryExporter;
+use Doctrine\ORM\EntityManagerInterface;
+use Symfony\Component\HttpFoundation\File\UploadedFile;
+class SQLiteCategoryExporter
+{
+public function __construct(
+private EntityManagerInterface $entityManager,
+private CategoryTableBuilder $tableBuilder,
+private SQLiteConnectionFactory $connFactory,
+) {}
+/**
+* Export all parts grouped by category to flat SQLite DB
+*/
+public function exportToSQLiteFile(string $outputPath): void
+{
+// Create new in-memory or file-based SQLite DB
+$connection = $this->connFactory->createConnection($outputPath);
+// Get all categories with their parts
+$categories = $this->getAllCategoriesWithParts();
+foreach ($categories as $category) {
+$this->tableBuilder->createAndPopulateTable(
+$connection,
+$category
+);
+}
+$connection->close();
+}/**
+* Stream SQLite file as download
+*/
+public function getExportResponse(): StreamedResponse
+{
+// Create temp file
+// Export to it
+// Return StreamedResponse
+}
+}
+2. Category Table Builder (Single Responsibility)
+// src/Services/ImportExportSystem/SQLiteCategoryExporter/CategoryTableBuilder.php
+class CategoryTableBuilder
+{
+public function __construct(
+private PartFieldMapper $fieldMapper,
+) {}
+public function createAndPopulateTable(
+\PDO $connection,
+Category $category
+): void {
+// Generate safe table name from category
+$tableName = $this->sanitizeTableName($category);
+// Get all parts in this category (recursive)
+$parts = $category->getParts();
+if (empty($parts)) {
+return; // Skip empty categories
+}
+// Build CREATE TABLE statement from first part's fields
+$columns = $this->fieldMapper->getPartColumns($parts[0]);
+$createSql = $this->buildCreateTableSQL($tableName, $columns);
+// Execute CREATE TABLE
+$connection->exec($createSql);
+// Prepare INSERT statement
+$insertSql = $this->buildInsertSQL($tableName, $columns);
+$stmt = $connection->prepare($insertSql);// Populate table with all parts
+foreach ($parts as $part) {
+$values = $this->fieldMapper->mapPartToRow($part, $columns);
+$stmt->execute($values);
+}
+}
+private function buildCreateTableSQL(string $table, array $columns): string
+{
+$defs = [];
+foreach ($columns as $name => $type) {
+$defs[] = "`$name` $type";
+}
+return "CREATE TABLE `$table` (\n
+. implode(",\n
+id INTEGER PRIMARY KEY,\n
+"
+", $defs) . "\n)";
+}
+}
+3. Field Mapper (Extensible)
+// src/Services/ImportExportSystem/SQLiteCategoryExporter/PartFieldMapper.php
+class PartFieldMapper
+{
+/**
+* Define which Part fields to export and their SQLite types
+*/
+public function getPartColumns(Part $part): array
+{
+return [
+'name' => 'TEXT NOT NULL',
+'ipn' => 'TEXT',
+'description' => 'TEXT',
+'category' => 'TEXT',
+'comment' => 'TEXT',
+'created_at' => 'DATETIME',
+'updated_at' => 'DATETIME',
+'instock' => 'INTEGER DEFAULT 0',
+// Add parameters as JSON column for flexibility
+'parameters' => 'TEXT', // JSON string
+];
+}
+/**
+* Extract data from Part entity
+*/public function mapPartToRow(Part $part, array $columns): array
+{
+$row = [];
+foreach (array_keys($columns) as $fieldName) {
+$row[$fieldName] = match($fieldName) {
+'name' => $part->getName(),
+'ipn' => $part->getIPN(),
+'instock' => $part->getInstock(),
+'parameters' => json_encode($this->paramsToArray($part)),
+// ... other mappings
+default => null,
+};
+}
+return $row;
+}
+private function paramsToArray(Part $part): array
+{
+// Convert Part's parameter objects to simple array
+// for JSON serialization
+return array_map(fn($p) => [
+'name' => $p->getName(),
+'value' => $p->getValue(),
+'unit' => $p->getUnit(),
+], $part->getParameters()->toArray());
+}
+}
+4. SQLite Connection Factory
+// src/Services/ImportExportSystem/SQLiteCategoryExporter/SQLiteConnectionFactory.php
+class SQLiteConnectionFactory
+{
+public function createConnection(string $filePath): \PDO
+{
+$dsn = "sqlite:$filePath";
+$pdo = new \PDO($dsn, null, null, [
+\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+\PDO::ATTR_DEFAULT_FETCH_MODE => \PDO::FETCH_ASSOC,
+]);
+// Enable foreign keys if needed$pdo->exec('PRAGMA foreign_keys = ON');
+return $pdo;
+}
+}
+Integration Points (Minimal)
+Option A: Console Command (No UI Changes)
+// src/Command/ExportCategoryDataCommand.php
+#[AsCommand(
+name: 'partdb:export:sqlite-categories',
+description: 'Export inventory as flat SQLite DB with per-category tables'
+)]
+class ExportCategoryDataCommand extends Command
+{
+public function __construct(
+private SQLiteCategoryExporter $exporter
+) {
+parent::__construct();
+}
+protected function execute(InputInterface $input, OutputInterface $output): int
+{
+$outputFile = 'var/exports/parts_by_category.db';
+$this->exporter->exportToSQLiteFile($outputFile);
+$output->writeln("Export complete: $outputFile");
+return Command::SUCCESS;
+}
+}
+Added to: config/services.yaml (auto-wiring by default)
+Option B: Controller Endpoint (Minimal UI Integration)
+// src/Controller/Tools/ExportController.php (new file)
+class ExportController extends AbstractController
+{public function __construct(
+private SQLiteCategoryExporter $exporter
+) {}
+#[Route('/tools/export/sqlite-categories', name: 'export_sqlite_categories')]
+#[IsGranted('EXPORT')]
+public function exportSQLiteCategories(): StreamedResponse
+{
+return $this->exporter->getExportResponse();
+}
+}
+Added to: Routes auto-discovered via attributes
+Option C: Add Button to Tools UI (Single Line Change)
+In the Tools template, add one button:
+<a href="{{ path('export_sqlite_categories') }}" class="btn btn-primary">
+Export as SQLite (by Category)
+</a>
+This is the ONLY UI file touched.
+Service Registration (Auto)
+Symfony will auto-wire everything because:
+1. All classes are in src/Services/
+2. They’re properly type-hinted
+3. config/services.yaml has App\: autoconfigure enabled by default
+No manual registration needed.
+Testing (Fully Isolated)
+// tests/Services/ImportExportSystem/SQLiteCategoryExporterTest.php
+class SQLiteCategoryExporterTest extends TestCase
+{private SQLiteCategoryExporter $exporter;
+private EntityManagerInterface $em;
+public function testExportsAllCategoriesSeparately(): void
+{
+// Create test categories with parts
+$cat1 = new Category('Resistors');
+$cat1->addPart($this->createPart('R1', '1k'));
+$cat2 = new Category('Capacitors');
+$cat2->addPart($this->createPart('C1', '100nF'));
+// Export
+$file = tempnam(sys_get_temp_dir(), 'test_');
+$this->exporter->exportToSQLiteFile($file);
+// Verify
+$db = new \PDO("sqlite:$file");
+$resistorTable = $db->query('SELECT COUNT(*) FROM `Resistors`')->fetchColumn();
+$this->assertEquals(1, $resistorTable);
+$capacitorTable = $db->query('SELECT COUNT(*) FROM `Capacitors`')->fetchColumn();
+$this->assertEquals(1, $capacitorTable);
+}
+}
+Files Modified / Added Summary
+File/Path
+Type
+Change
+New
+module
+src/Services/ImportExportSystem/SQLiteCategoryExporter/*.php
+Added
+(no
+existing
+code)
+Optional
+src/Command/ExportCategoryDataCommand.php
+Added
+console
+command
+Optional
+src/Controller/Tools/ExportController.php
+Added
+web
+endpointTools UI template
+Modified
+1 button
+(optional)
+No
+Core mainline files
+None
+changes
+required
+PR Strategy
+Commit 1: Core Exporter (100% self-contained)
+Add SQLiteCategoryExporter service module
+- SQLiteCategoryExporter: Orchestrates export workflow
+- CategoryTableBuilder: Creates & populates per-category tables
+- PartFieldMapper: Maps Part entities to SQL columns
+- SQLiteConnectionFactory: Manages SQLite connections
+- Fully testable, zero dependencies on mainline code
+Commit 2: CLI Command (Light integration)
+Add console command: partdb:export:sqlite-categories
+Users can now export via: php bin/console partdb:export:sqlite-categories
+Commit 3: Web UI (Optional)
+Add export button to Tools UI
+- New ExportController endpoint
+- Allows web-based download of SQLite file
+- Uses same exporter service as CLI
+Commit 4: Tests
+Add comprehensive test suite for SQLiteCategoryExporterAdvantages of This Approach
+1. Zero Disruption: Exists entirely in its own namespace
+2. Easy to Review: Each class has one responsibility
+3. Fully Testable: No coupling to controllers or core entities
+4. Configurable: Maintainers can easily tweak field mappings via PartFieldMapper
+5. Easy to Disable: Delete the service, comment out the button
+6. Follows Symfony Conventions: Uses standard service auto-wiring, commands,
+controllers
+7. Low Review Burden: Self-contained code is low-risk to merge
+Potential Concerns & Answers
+Q: What if Part-DB adds new fields in the future?
+A: PartFieldMapper.getPartColumns() is the only place to update. One file.
+Q: What about nested data (parameters, storage locations)?
+A: Handled flexibly via JSON columns, or expand CategoryTableBuilder to create child
+tables per category.
+Q: What if someone wants to export by manufacturer instead of category?
+A: Create ManufacturerTableBuilder , reuse everything else. No mainline changes.
+Q: Performance for large inventories?
+A: Uses streaming inserts. Can add pagination/batching in CategoryTableBuilder if
+needed.
+Example PR Description
+Feature: SQLite Category Export
+Add a new export service that generates a flat SQLite database
+with a separate table for each part category. Useful for:
+- External analysis and reporting
+- Sharing category-specific datasets
+- Integration with external tools (PCB design, EM simulation)- Lightweight read-only copies of inventory slices
+Includes:
+- Fully isolated SQLiteCategoryExporter service module
+- Console command: `partdb:export:sqlite-categories`
+- Optional web UI integration via ExportController
+- Comprehensive test coverage
+Zero mainline modifications. Can be disabled by removing
+src/Services/ImportExportSystem/SQLiteCategoryExporter/.
+Closes #XXX
